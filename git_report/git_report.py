@@ -1,74 +1,51 @@
 #!/usr/bin/env python3
 
 import argparse
-import csv
-import json
+import logging
 import os
 import re
 import subprocess
 import sys
-import logging
 from collections import defaultdict
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
-from enum import Enum
+from datetime import datetime
 from pathlib import Path
-from typing import List, Pattern, Dict
+from typing import Pattern, Iterator
 
-import matplotlib.pyplot as plt
-from dateutil.relativedelta import relativedelta
+from data import Commit, Commits, Period
+from exporters import exporters
+from plotters import plotters, format_period
 
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 
 
-class PeriodType(Enum):
-    DAY = 0
-    WEEK = 1
-    MONTH = 2
-
-
-@dataclass
-class Commit:
-    repo_name: str
-    hash: str
-    author: str
-    date: str
-    subject: str
-
-
-type Commits = list[Commit]
-
-
-def find_git_repos(base_path: str, exclude_patterns: List[Pattern[str]]) -> List[str]:
-    """
-    Recursively find Git repositories under base_path, excluding any directory
-    whose path matches at least one regext in exclude_patterns
-
-    :param base_path: str, root directory to start search
-    :param exclude_patterns: list of compiled regex patterns
-    :return: list of repo paths
-    """
-    git_repos = []
+def iter_git_repos(
+    base_path: Path, exclude_patterns: list[Pattern[str]]
+) -> Iterator[Path]:
     for root, dirs, files in os.walk(base_path):
-        if any(pat.search(root) for pat in exclude_patterns):
-            dirs.clear()  # prevent descending further
+        current_path: Path = Path(root)
+
+        # skip directory entirely if it matches an exclude pattern
+        if any(p.search(str(current_path)) for p in exclude_patterns):
+            dirs[:] = []
             continue
+
+        # if `.git` exists here, yield the repo root
         if ".git" in dirs:
-            git_repos.append(root)
-            dirs.clear()  # prevent descending further
-    return git_repos
+            yield current_path
+            dirs.remove(".git")
 
 
-def get_commit_stats(
-    repo_path: Path, author_filter: str, since: str, until: str
-) -> Commits:
+def get_commit_stats(repo_path: Path, author: str, since: str, until: str) -> Commits:
     """
     Get a list of commit dates (YYYY-MM-DD) for commits matching the author
 
     :param repo_path: path to the git repository
-    :param author_filter: author email or username
+    :param author: author email or username
     :param since: start date (YYYY-MM-DD)
     :param until: end date (YYYY-MM-DD)
     :return: list of commit dates as strings
@@ -81,17 +58,17 @@ def get_commit_stats(
         "--all",
         f"--since={since}",
         f"--until={until}",
-        f"--author={author_filter}",
+        f"--author={author}",
         "--pretty=format:%H|%ae|%ad|%s",
         "--date=short",
     ]
     result = subprocess.run(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    if result.returncode != 0:
-        return []
+    if result.returncode != EXIT_SUCCESS:
+        raise RuntimeError(f"git query failed with ret code {result.returncode}")
 
-    repo_name: str = os.path.basename(repo_path.rstrip(os.sep))
+    repo_name: str = repo_path.name
     commits: Commits = []
 
     for line in result.stdout.splitlines():
@@ -104,45 +81,7 @@ def get_commit_stats(
     return commits
 
 
-def format_period(date: datetime, period: PeriodType) -> str:
-    if period is PeriodType.DAY:
-        return date.strftime("%Y-%m-%d")
-    elif period is PeriodType.WEEK:
-        return f"{date.isocalendar().year}-W{date.isocalendar().week:02d}"
-    elif period is PeriodType.MONTH:
-        return date.strftime("%Y-%m")
-    else:
-        raise ValueError("Unsupported period")
-
-
-def make_period_key(commit: Commit, period: PeriodType) -> str:
-    dt = datetime.strptime(commit.date, "%Y-%m-%d")
-    return format_period(dt, period)
-
-
-def generate_dates(
-    start: Commit, end: Commit, step: PeriodType, interval: int = 1
-) -> Dict[str, Dict[str, int]]:
-    dates = defaultdict(lambda: defaultdict(int))
-    start_date = datetime.strptime(start.date, "%Y-%m-%d")
-    end_date = datetime.strptime(end.date, "%Y-%m-%d")
-
-    current = start_date
-    while current <= end_date:
-        dates[format_period(current, step)] = defaultdict(int)
-        if step == PeriodType.DAY:
-            current += timedelta(days=interval)
-        elif step == PeriodType.WEEK:
-            current += timedelta(weeks=interval)
-        elif step == PeriodType.MONTH:
-            current += relativedelta(months=interval)
-        else:
-            raise ValueError("step must be 'days', 'weeks', or 'months'")
-
-    return dates
-
-
-def aggregate_by_period(commits: Commits, period: PeriodType) -> Dict[str, int]:
+def aggregate_by_period(commits: Commits, period: Period) -> dict[str, int]:
     """
     Aggregate commit dates by 'daily', 'weekly' or 'monthly'
 
@@ -150,111 +89,11 @@ def aggregate_by_period(commits: Commits, period: PeriodType) -> Dict[str, int]:
     :param period:
     :return:
     """
-    counts: Dict[str, int] = defaultdict(int)
+    counts: dict[str, int] = defaultdict(int)
     for commit in commits:
-        key = make_period_key(commit, period)
+        key = format_period(datetime.strptime(commit.date, "%Y-%m-%d"), period)
         counts[key] += 1
     return dict(sorted(counts.items()))
-
-
-def export_data(commits: Commits, fmt: str, output_file: Path) -> None:
-    """
-    Export commit data as json/csv file
-
-    :param commits:
-    :param fmt:
-    :param output_file:
-    :return:
-    """
-    if not output_file.lower().endswith(f".{fmt}"):
-        output_file += f".{fmt}"
-    if fmt == "json":
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(commits, f, default=lambda o: o.__dict__, indent=2)
-    elif fmt == "csv":
-        if not commits:
-            return
-        with open(output_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f, fieldnames=["repo_name", "hash", "author", "date", "subject"]
-            )
-            writer.writeheader()
-            for commit in commits:
-                writer.writerow(asdict(commit))
-    else:
-        raise ValueError("Unsupported export file format")
-    # print(f"Exported {len(commits)} to {output_file} ({fmt.upper()})")
-
-
-def plot_commits(commits: Commits, period: PeriodType, output_file: Path) -> None:
-    if not commits:
-        # print("No commits to plot")
-        return
-
-    # aggregate: {period_label: {repo: count}}
-    data = generate_dates(commits[0], commits[-1], period)
-    repos = set()
-
-    for commit in commits:
-        key = make_period_key(commit, period)
-        data[key][commit.repo_name] += 1
-        repos.add(commit.repo_name)
-
-    # sort periods chronologically
-    periods = sorted(data.keys())
-    repos = sorted(repos)
-
-    # prepare stacked data
-    bottom = [0] * len(periods)
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    for repo in repos:
-        heights = [data[period].get(repo, 0) for period in periods]
-        rects = ax.bar(periods, heights, bottom=bottom, label=repo)
-        ax.bar_label(rects, fmt=lambda x: int(x) if x > 0 else "", label_type="center")
-        bottom = [b + h for b, h in zip(bottom, heights)]
-
-    ax.set_title(
-        f"Commits per Repository ({period.name.capitalize()}) by "
-        f"<{commits[0].author}>"
-    )
-    ax.set_xlabel("Period")
-    ax.set_ylabel("Number of Commits")
-    ax.legend(title="Repository", bbox_to_anchor=(1.05, 1), loc="upper left")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-    plt.savefig(output_file)
-    # print(f"Plot saved to {output_file}")
-
-
-def plot_summary(commits: Commits, output_file: str) -> None:
-    if not commits:
-        return
-
-    data = defaultdict(int)
-    for commit in commits:
-        data[commit.repo_name] += 1
-
-    data = dict(sorted(data.items(), key=lambda item: item[1]))
-
-    values = list(data.values())
-    labels = list(data.keys())
-
-    def absolute_value(val):
-        total = sum(values)
-        value = int(round(val * total / 100))
-        return f"{value}"
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.set_title(
-        f"Commits per Repository (from "
-        f"{make_period_key(commits[0], PeriodType.DAY)} to {
-        make_period_key(commits[-1], PeriodType.DAY)
-        }) by <{commits[0].author}>"
-    )
-    ax.pie(values, labels=labels, autopct=absolute_value)
-    plt.axis("equal")
-    plt.savefig(output_file)
 
 
 def main() -> int:
@@ -270,26 +109,25 @@ def main() -> int:
     parser.add_argument("--weekly", action="store_true")
     parser.add_argument("--monthly", action="store_true")
     parser.add_argument("--export", choices=["csv", "json"])
-    parser.add_argument("--export-output")
+    parser.add_argument("--export-output", default="export")
     parser.add_argument("--plot", choices=["stats", "summary"])
     parser.add_argument("--plot-output")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     base_path: Path = Path(args.path)
-    exclude_patterns = [re.compile(p) for p in args.exclude]
-    repos = find_git_repos(base_path=base_path, exclude_patterns=exclude_patterns)
-    if not repos:
-        logging.error("No git repositories found")
-        return EXIT_FAILURE
+    exclude_patterns: list[Pattern[str]] = [re.compile(p) for p in args.exclude]
 
     total = 0
     commits: Commits = []
 
-    logging.info(f"Scanning {len(repos)} repositories...\n")
-    for repo in repos:
+    for repo in iter_git_repos(base_path=base_path, exclude_patterns=exclude_patterns):
         commits_in_repo = get_commit_stats(
             repo_path=repo,
-            author_filter=args.author,
+            author=args.author,
             since=args.since,
             until=args.until,
         )
@@ -297,7 +135,7 @@ def main() -> int:
             count = len(commits_in_repo)
             total += count
             commits.extend(commits_in_repo)
-            print(f"{repo} -> {count} commits")
+            logging.debug(f"{repo} -> {count} commits")
 
     print("\n=== Summary ===")
     print(f"Author: {args.author}")
@@ -306,33 +144,61 @@ def main() -> int:
 
     if args.daily:
         print("\nCommits by day:")
-        for day, count in aggregate_by_period(commits, period=PeriodType.DAY).items():
+        for day, count in aggregate_by_period(commits, period=Period.DAY).items():
             print(f"{day}: {count}")
 
     if args.weekly:
         print("\nCommits by week:")
-        for week, count in aggregate_by_period(commits, period=PeriodType.WEEK).items():
+        for week, count in aggregate_by_period(commits, period=Period.WEEK).items():
             print(f"{week}: {count}")
 
     if args.monthly:
         print("\nCommits by month:")
-        for month, count in aggregate_by_period(commits, PeriodType.MONTH).items():
+        for month, count in aggregate_by_period(commits, period=Period.MONTH).items():
             print(f"{month}: {count}")
 
-    if args.export and args.export_output:
-        export_data(commits, fmt=args.export, output_file=args.export_output)
+    print()
 
-    p = (
-        PeriodType.DAY
-        if args.daily
-        else PeriodType.WEEK if args.weekly else PeriodType.MONTH
-    )
-    if args.plot_output:
-        commits.sort(key=lambda c: datetime.strptime(c.date, "%Y-%m-%d"))
-        if args.plot == "stats":
-            plot_commits(commits, period=p, output_file=args.plot_output)
-        elif args.plot == "summary":
-            plot_summary(commits, output_file=args.plot_output)
+    if args.export:
+        output_format: str = args.export
+        exporter = exporters.get(output_format)
+        if exporter is None:
+            logging.error(f"Exporting to format {output_format} is not supported")
+        else:
+            output_file: Path = Path(args.export_output)
+            if output_file.suffix == "":
+                output_file = output_file.with_suffix(f".{output_format}")
+            logging.debug(f"Exporting {output_file.name}")
+            exporter(commits, output_file)
+
+    if args.plot:
+        plotter = plotters.get(args.plot)
+        if plotter is None:
+            logging.error(f"Plot type {args.plot} is not supported")
+        else:
+            commits.sort(key=lambda c: datetime.strptime(c.date, "%Y-%m-%d"))
+            plot_file: Path = Path(
+                args.plot_output if args.plot_output else (f"plot.png")
+            )
+            if args.daily:
+                logging.debug(f"Exporting {plot_file}")
+                plotter(
+                    commits, plot_file.with_stem(plot_file.stem + "_daily"), Period.DAY
+                )
+            if args.weekly:
+                logging.debug(f"Exporting {plot_file}")
+                plotter(
+                    commits,
+                    plot_file.with_stem(plot_file.stem + "_weekly"),
+                    Period.WEEK,
+                )
+            if args.monthly:
+                logging.debug(f"Exporting {plot_file}")
+                plotter(
+                    commits,
+                    plot_file.with_stem(plot_file.stem + "_monthly"),
+                    Period.MONTH,
+                )
 
     return EXIT_SUCCESS
 
